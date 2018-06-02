@@ -16,10 +16,10 @@ tf.flags.DEFINE_bool('normalize', False, 'normalize feature data')
 tf.flags.DEFINE_float('dropout', 0.2, 'dropout rate')
 tf.flags.DEFINE_string('model', 'GRU', 'RNN, GRU or LSTM')
 tf.flags.DEFINE_string('data_dir', 'data', 'directory of original data files')
+tf.flags.DEFINE_string('test_data_dir', 'test_data', 'directory of testing data files')
 tf.flags.DEFINE_string('log_dir', 'tmp/runs/', 'directory to save log file')
 tf.flags.DEFINE_bool('per_frame', True, 'RNN on per frame (row) data instead '
                                         'of taking the whole MFCC vector ')
-
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -39,6 +39,7 @@ class Params(object):
     dropout = FLAGS.dropout
     model = FLAGS.model
     data_dir = FLAGS.data_dir
+    test_data_dir = FLAGS.test_data_dir
     log_dir = FLAGS.log_dir
     num_classes = 3
     feature_length = 13
@@ -58,6 +59,7 @@ def generate_data(params):
     sequence_length = []
     for subdir, dirs, files in os.walk(params.data_dir):
         for speaker in dirs:
+
             with open(os.path.join(
                     params.data_dir, speaker, 'transcripts.txt'), 'r') as f:
                 transcripts = f.readlines()
@@ -94,6 +96,76 @@ def generate_data(params):
         features[i] = np.vstack(
             (features[i], np.zeros(shape=(padding, params.feature_length))))
 
+    # convert to ndarray
+    features, labels = np.asarray(features), np.asarray(labels)
+
+    # normalize features
+    if params.normalize:
+        shape = features.shape
+        # normalize function only takes 2D matrix
+        features = np.reshape(features, newshape=(shape[0], shape[1] * shape[2]))
+        features = normalize(features, norm='l2')
+        features = np.reshape(features, newshape=shape)
+
+    assert features.shape[0] == labels.shape[0] == len(sequence_length)
+
+    # randomly shuffle data
+    features, labels, sequence_length = \
+        shuffle(features, labels, sequence_length, random_state=1)
+
+    return features, labels, sequence_length
+
+
+def generate_test_data(params):
+    """ Extract data and transcript from FLAGS.test_data_dir
+    Note: 0 indicate True, 1 indicate Lie Up, 2 indicate Lie Down for labels
+    """
+    if not os.path.exists(params.test_data_dir):
+        print("Test Data directory %s not found" % params.test_data_dir)
+        exit()
+    features = []
+    labels = []
+    sequence_length = []
+    for subdir, dirs, files in os.walk(params.data_dir):
+        for speaker in dirs:
+            print(speaker)
+            with open(os.path.join(
+                    params.data_dir, speaker, 'transcripts.txt'), 'r') as f:
+                transcripts = f.readlines()
+            if not transcripts:
+                continue
+            files = sorted(fnmatch.filter(os.listdir(
+                os.path.join(params.data_dir, speaker)), '*npy'))
+            print(files)
+            assert len(transcripts) == len(files)
+
+            for i in range(len(transcripts)):
+                # read MFCC vector from npy file
+                features.append(np.load(
+                    os.path.join(FLAGS.data_dir, speaker, files[i])))
+                print(features.shape)
+                # read label from transcripts
+                label = transcripts[i].split()[1]
+                if label.startswith('T'):
+                    labels.append(0)
+                elif label.startswith('LU'):
+                    labels.append(1)
+                elif label.startswith('LD'):
+                    labels.append(2)
+                else:
+                    print("Incorrect label: %s" % label)
+                    exit()
+        # features now has all the npy files array one fter another
+
+    # add padding to create equal length MFCC vectors
+    params.max_length = max([feature.shape[0] for feature in features])
+
+    for i in range(len(features)):
+        # pad vectors
+        padding = params.max_length - features[i].shape[0]
+        sequence_length.append(features[i].shape[0])
+        features[i] = np.vstack(
+            (features[i], np.zeros(shape=(padding, params.feature_length))))
 
     # convert to ndarray
     features, labels = np.asarray(features), np.asarray(labels)
@@ -193,6 +265,7 @@ def model_fn(features, labels, mode, params):
     logits = rnn(features, mode, params)
 
     predictions = tf.argmax(tf.nn.softmax(logits), axis=-1)
+    predictions = tf.Print(predictions, [predictions])
 
     loss = tf.reduce_mean(
         tf.nn.sparse_softmax_cross_entropy_with_logits(
@@ -200,6 +273,7 @@ def model_fn(features, labels, mode, params):
             logits=logits
         )
     )
+    loss = tf.Print(loss, [loss])
 
     train_op = tf.train.AdamOptimizer(params.lr).minimize(
         loss=loss,
@@ -241,20 +315,23 @@ def main():
         os.makedirs(params.log_dir)
 
     features, labels, sequence_length = generate_data(params)
+    test_features, test_labels, test_sequence_length = generate_test_data(params)
     # index of training and testing data split
-    split = int(len(labels) * 0.8)
+    # split1 = int(len(labels) * 0.8)
+    # split2 = int(len(labels) * 0.1)
 
     # calculate the amount of train and test steps
-    params.train_steps = int(split / params.batch_size) * params.epochs
-    params.eval_steps = int((len(features) - split) / params.batch_size)
+    params.train_steps = int(len(labels) / params.batch_size) * params.epochs
+    params.eval_steps = int((len(test_features)) / params.batch_size)
+    # params.predict_steps = int(split2 / params.batch_size)
 
     def train_input_fn(params):
         dataset = tf.data.Dataset.from_tensor_slices((
             {
-                'feature': features[:split],
-                'sequence_length': sequence_length[:split]
+                'feature': features[:],
+                'sequence_length': sequence_length[:]
             },
-            labels[:split]
+            labels[:]
         ))
         dataset = dataset.repeat().batch(params.batch_size)
         x, y = dataset.make_one_shot_iterator().get_next()
@@ -263,10 +340,10 @@ def main():
     def eval_input_fn(params):
         dataset = tf.data.Dataset.from_tensor_slices((
             {
-                'feature': features[split:],
-                'sequence_length': sequence_length[split:]
+                'feature': test_features[:],
+                'sequence_length': test_sequence_length[:]
             },
-            labels[split:]
+            test_labels[:]
         ))
         dataset = dataset.batch(params.batch_size)
         x, y = dataset.make_one_shot_iterator().get_next()
@@ -276,6 +353,8 @@ def main():
     config = tf.estimator.RunConfig(
         save_checkpoints_steps=params.eval_every
     )
+
+
 
     # define Estimator class for model
     estimator = tf.estimator.Estimator(
@@ -294,7 +373,6 @@ def main():
         input_fn=eval_input_fn,
         steps=params.eval_steps
     )
-
     # train and evaluate model
     tf.estimator.train_and_evaluate(
         estimator=estimator,
